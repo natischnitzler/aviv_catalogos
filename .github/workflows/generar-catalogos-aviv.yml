@@ -189,8 +189,21 @@ async function odooCall(model, method, args) {
 async function fetchProductos() {
   console.log('📦 Obteniendo productos de Odoo...');
   const raw = await odooCall('product.product', 'search_read', [
-    [], ['default_code','name','list_price','qty_available','virtual_available','categ_id','product_tmpl_id']
+    [], ['default_code','name','list_price','qty_available','virtual_available','categ_id',
+         'product_tmpl_id','metal_type','rock_type','product_template_attribute_value_ids']
   ]);
+
+  // Nombres de los valores de atributo de variante (ej. "13", "15") en un solo batch,
+  // para no hacer una consulta por producto.
+  const attrIds = [...new Set(raw.flatMap(p => p.product_template_attribute_value_ids || []))];
+  const attrNombres = {};
+  if (attrIds.length) {
+    try {
+      const attrs = await odooCall('product.template.attribute.value', 'read', [attrIds, ['name']]);
+      for (const a of attrs) attrNombres[a.id] = a.name;
+    } catch(e) { console.log('  ⚠️  Sin medidas/atributos:', e.message); }
+  }
+
   const productos = raw
     .map(p => ({
       Default_code: p.default_code || '',
@@ -200,6 +213,10 @@ async function fetchProductos() {
       Incoming:     Math.max(0, (p.virtual_available||0) - (p.qty_available||0)),
       Category:     p.categ_id ? p.categ_id[1].trim() : '',
       TmplId:       p.product_tmpl_id ? p.product_tmpl_id[0] : null,
+      Metal:        p.metal_type ? p.metal_type[1] : '',
+      Piedra:       p.rock_type ? p.rock_type[1] : '',
+      Medida:       (p.product_template_attribute_value_ids || [])
+                      .map(id => attrNombres[id]).filter(Boolean).join(', '),
     }))
     // Solo productos con stock > 0 o incoming > 0
     .filter(p => p.Stock > 0 || p.Incoming > 0);
@@ -284,12 +301,12 @@ async function generarPDF(nombreArchivo, productos, orden, caracteristicas, imgs
   const mg     = 4   * MM;
   const headerH  = (210 * (202/1544)) * MM;   // ratio del banner header_aviv.png (1544x202)
   const footerH  = 10  * MM;
-  const COLS     = 4;
+  const COLS     = 3;
   const ROWS     = 4;
-  const PER_PG   = 16;
+  const PER_PG   = 12;
   const cellW    = (PAGE_W - mg*2) / COLS;
   const cellH    = 58  * MM;
-  const imgAreaH = 42  * MM;
+  const imgAreaH = 36  * MM;
   const totalH   = ROWS * cellH;
   const subtitleH = 6 * MM;  // espacio para nombre de subcategoría
   const available = PAGE_H - mg*2 - headerH - subtitleH - footerH;
@@ -393,19 +410,37 @@ async function generarPDF(nombreArchivo, productos, orden, caracteristicas, imgs
 
     const conStar = p.Incoming > 0 && p.Stock === 0;
     const codigo  = limpiarCodigo(p.Default_code) || '';
-    const infoY   = y + imgAreaH + 1.5*MM;
+    let   infoY   = y + imgAreaH + 1*MM;
+
+    const nombre = (p.Name || '').trim();
+    if (nombre) {
+      const nombreCorto = nombre.length > 42 ? nombre.slice(0, 41).trim() + '…' : nombre;
+      doc.fontSize(7.5).fillColor('#333333').font('Helvetica-Bold')
+        .text(nombreCorto, x+1*MM, infoY, { width: cellW-2*MM, align: 'center', lineBreak: false });
+      infoY += 3.3*MM;
+    }
 
     doc.fontSize(9).fillColor('#000000').font('Helvetica-Bold')
       .text(codigo + (conStar ? ' *' : ''), x, infoY,
         { width: cellW, align: 'center', lineBreak: false });
+    infoY += 3.5*MM;
 
     doc.fontSize(8.5).fillColor('#000000').font('Helvetica')
       .text(`$${Math.round(p.Price||0).toLocaleString('es-CL')} + IVA`,
-        x, infoY+3.5*MM, { width: cellW, align: 'center', lineBreak: false });
+        x, infoY, { width: cellW, align: 'center', lineBreak: false });
+    infoY += 3.5*MM;
 
-    // (Se sacó la "descripción de venta" de Odoo del card: para los productos
-    // de Aviv ese campo trae texto tipo breadcrumb/variantes, no una
-    // descripción útil, y solo generaba ruido repetido en cada producto.)
+    const metalPiedra = [p.Metal, p.Piedra].filter(Boolean).join('  ·  ');
+    if (metalPiedra) {
+      doc.fontSize(7).fillColor('#666666').font('Helvetica')
+        .text(metalPiedra, x+1*MM, infoY, { width: cellW-2*MM, align: 'center', lineBreak: false });
+      infoY += 3*MM;
+    }
+
+    if (p.Medida) {
+      doc.fontSize(7).fillColor('#666666').font('Helvetica')
+        .text(`Medida: ${p.Medida}`, x+1*MM, infoY, { width: cellW-2*MM, align: 'center', lineBreak: false });
+    }
 
     pageIdx++;
   }
