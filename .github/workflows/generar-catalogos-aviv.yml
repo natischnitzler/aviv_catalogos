@@ -6,7 +6,7 @@ on:
   workflow_dispatch:          # Botón "Run workflow" para correrlo a mano
 
 permissions:
-  contents: write             # necesario para guardar imagenes_cache.json de vuelta en el repo
+  contents: write             # necesario para guardar catalogos_links.json de vuelta en el repo
 
 jobs:
   generar:
@@ -29,6 +29,16 @@ jobs:
       - name: Instalar dependencias
         run: npm install
 
+      # imagenes_cache.json puede pesar más de 100MB (límite de git para archivos
+      # en el repo), así que se guarda con el cache de Actions, NO como commit.
+      - name: Restaurar cache de imágenes
+        uses: actions/cache/restore@v4
+        with:
+          path: imagenes_cache.json
+          key: imagenes-cache-${{ github.run_id }}
+          restore-keys: |
+            imagenes-cache-
+
       - name: Generar catálogos
         env:
           ODOO_URL:              ${{ secrets.ODOO_URL }}
@@ -40,10 +50,17 @@ jobs:
           GH_REPO_NAME:            ${{ secrets.GH_REPO_NAME }}
         run: node generar-catalogos-aviv.js
 
-      - name: Guardar cache de imágenes en el repo
+      - name: Guardar cache de imágenes actualizado
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: imagenes_cache.json
+          key: imagenes-cache-${{ github.run_id }}
+
+      - name: Guardar catalogos_links.json en el repo
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git add imagenes_cache.json catalogos_links.json 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "Actualizar cache de catálogos [skip ci]"
+          git add catalogos_links.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "Actualizar links de catálogos [skip ci]"
           git push
