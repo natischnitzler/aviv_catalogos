@@ -1,12 +1,12 @@
 // ══════════════════════════════════════════════════════════════════════════════
-// AVIV — Generador de catálogos PDF → Dropbox
+// AVIV — Generador de catálogos PDF → GitHub Releases
 // A diferencia del script de Temponovo, ACÁ NO SE LISTAN CATÁLOGOS A MANO:
 // se generan automáticamente uno por cada categoría que exista en Odoo
 // (Oro / Anillo, Oro / Aro, Plata / Collar, etc.) — si en Odoo agregan o
 // renombran una categoría, en la próxima corrida aparece/desaparece solo.
 //
-// Uso: DROPBOX_TOKEN=xxx node generar-catalogos-aviv.js
-//      DROPBOX_TOKEN=xxx node generar-catalogos-aviv.js "Anillo"   (filtra por nombre)
+// Uso: GH_TOKEN_RELEASES=xxx node generar-catalogos-aviv.js
+//      GH_TOKEN_RELEASES=xxx node generar-catalogos-aviv.js "Anillo"   (filtra por nombre)
 // ══════════════════════════════════════════════════════════════════════════════
 
 process.on('uncaughtException', err => {
@@ -24,16 +24,11 @@ const xmlrpc      = require('xmlrpc');
 let   sharp;
 try { sharp = require('sharp'); } catch(e) { sharp = null; }
 
-const DROPBOX_REFRESH_TOKEN = process.env.DROPBOX_REFRESH_TOKEN;
-const DROPBOX_APP_KEY       = process.env.DROPBOX_APP_KEY;
-const DROPBOX_APP_SECRET    = process.env.DROPBOX_APP_SECRET;
-const DROPBOX_FOLDER        = '';
-let   _dropboxAccessToken   = null;
 const CACHE_PATH     = path.join(__dirname, 'imagenes_cache.json');
 
 const GH_TOKEN      = process.env.GH_TOKEN_RELEASES;
 const GH_REPO_OWNER = process.env.GH_REPO_OWNER || 'natischnitzler';   // ⚠️ confirmar owner correcto para Aviv
-const GH_REPO_NAME  = process.env.GH_REPO_NAME  || 'aviv-catalogos';   // ⚠️ confirmar/crear este repo
+const GH_REPO_NAME  = process.env.GH_REPO_NAME  || 'aviv-catalogos';   // repo único (código + releases) — debe ser PÚBLICO para que WhatsApp/la web puedan descargar los PDFs sin login
 const GH_RELEASE_TAG = 'catalogos-latest';
 
 const ODOO_URL      = process.env.ODOO_URL      || 'https://aviv.odoo.com';
@@ -46,12 +41,13 @@ if (!ODOO_USERNAME || !ODOO_PASSWORD) {
   process.exit(1);
 }
 
+if (!GH_TOKEN) {
+  console.error('❌ Falta GH_TOKEN_RELEASES. Sin esto no hay dónde subir los catálogos (solo se usa GitHub Releases, no Dropbox).');
+  process.exit(1);
+}
+
 const HEADER_PATH = path.join(__dirname, 'header_aviv.png');
 const HEADER_IMG  = fs.existsSync(HEADER_PATH) ? fs.readFileSync(HEADER_PATH) : null;
-
-if (!DROPBOX_REFRESH_TOKEN || !DROPBOX_APP_KEY || !DROPBOX_APP_SECRET) {
-  console.warn('⚠️  Sin credenciales Dropbox — se saltará la subida a Dropbox');
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // CATÁLOGOS — 100% DINÁMICO, NO SE LISTAN A MANO
@@ -250,7 +246,7 @@ async function generarPDF(nombreArchivo, productos, orden, caracteristicas, imgs
   const PAGE_W = 210 * MM;
   const PAGE_H = 297 * MM;
   const mg     = 4   * MM;
-  const headerH  = (210 * (200/1866)) * MM;
+  const headerH  = (210 * (202/1544)) * MM;   // ratio del banner header_aviv.png (1544x202)
   const footerH  = 10  * MM;
   const COLS     = 4;
   const ROWS     = 4;
@@ -583,65 +579,6 @@ function filtrar(){
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// DROPBOX
-// ══════════════════════════════════════════════════════════════════════════════
-async function getDropboxToken() {
-  if (_dropboxAccessToken) return _dropboxAccessToken;
-  const res = await axios.post('https://api.dropbox.com/oauth2/token',
-    `grant_type=refresh_token&refresh_token=${DROPBOX_REFRESH_TOKEN}&client_id=${DROPBOX_APP_KEY}&client_secret=${DROPBOX_APP_SECRET}`,
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-  );
-  _dropboxAccessToken = res.data.access_token;
-  console.log('✅ Dropbox token renovado');
-  return _dropboxAccessToken;
-}
-
-async function subirADropbox(buffer, nombreArchivo) {
-  // Agregar _ antes de la extensión
-  nombreArchivo = nombreArchivo.replace(/\.([^.]+)$/, '_.$1');
-  const token = await getDropboxToken();
-  const res = await axios.post(
-    'https://content.dropboxapi.com/2/files/upload', buffer,
-    {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Dropbox-API-Arg': JSON.stringify({
-          path: `${DROPBOX_FOLDER}/${nombreArchivo}`,
-          mode: 'overwrite', autorename: false, mute: true
-        }),
-        'Content-Type': 'application/octet-stream'
-      },
-      maxBodyLength: Infinity
-    }
-  );
-  return res.data;
-}
-
-async function obtenerLinkCompartido(nombreArchivo) {
-  const token = await getDropboxToken();
-  const path = `${DROPBOX_FOLDER}/${nombreArchivo}`;
-  try {
-    const res = await axios.post(
-      'https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings',
-      { path, settings: { requested_visibility: 'public' } },
-      { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
-    );
-    return res.data.url.replace('?dl=0', '?dl=1');
-  } catch (err) {
-    if (err.response?.data?.error?.['.tag'] === 'shared_link_already_exists') {
-      const res2 = await axios.post(
-        'https://api.dropboxapi.com/2/sharing/list_shared_links',
-        { path },
-        { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
-      );
-      const link = res2.data.links?.[0]?.url;
-      return link ? link.replace('?dl=0', '?dl=1') : null;
-    }
-    throw err;
-  }
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
 // COMPRESION PDF (solo para GitHub/WhatsApp)
 // ══════════════════════════════════════════════════════════════════════════════
 const { execSync } = require('child_process');
@@ -835,14 +772,6 @@ async function main() {
       const buffer = await generarPDF(cat.archivo, prods, cat.orden, caracteristicas, cache, cat.titulo);
       console.log(`  ✅ PDF: ${(buffer.length/1024).toFixed(0)} KB`);
 
-      // Dropbox — opcional, no bloquea si falla
-      try {
-        const result = await subirADropbox(buffer, cat.archivo);
-        console.log(`  ☁️  Dropbox: ${result.path_display}`);
-      } catch(de) {
-        console.log(`  ⚠️  Dropbox: ${de.response?.data?.error_summary || de.message}`);
-      }
-
       // GitHub Releases — comprimir si pesa mas de 15MB
       if (GH_TOKEN && releaseId) {
         const mb = buffer.length / 1024 / 1024;
@@ -877,8 +806,12 @@ async function main() {
       const fecha = new Date().toLocaleDateString('es-CL', {day:'2-digit',month:'2-digit',year:'numeric'});
       const hora  = new Date().toLocaleTimeString('es-CL', {hour:'2-digit',minute:'2-digit'});
       const html  = generarHTML(todos, fecha, hora);
-      await subirADropbox(Buffer.from(html, 'utf8'), 'Stock_Aviv.html');
-      console.log('  ✅ Stock_Aviv.html subido a Dropbox');
+      if (GH_TOKEN && releaseId) {
+        const url = await subirAGithub(Buffer.from(html, 'utf8'), 'Stock_Aviv.html', releaseId);
+        console.log(`  🐙 Stock_Aviv.html subido: ${url}`);
+      } else {
+        console.log('  ⏭  Sin GitHub Release disponible, se omite Stock_Aviv.html');
+      }
     } catch(err) {
       console.error('  ❌ Error generando HTML:', err.message);
     }
