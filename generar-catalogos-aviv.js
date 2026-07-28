@@ -64,12 +64,29 @@ function construirCatalogosDinamicos(productos) {
     productos.map(p => (p.Category || '').trim()).filter(Boolean)
   )].sort((a, b) => a.localeCompare(b, 'es'));
 
-  return categorias.map(cat => ({
+  // Un catálogo por cada categoría exacta de Odoo (ej. "Oro / Aro", "Plata / Aro")
+  const porCategoria = categorias.map(cat => ({
     archivo: 'Catalogo_' + cat.replace(/\s*\/\s*/g, '_').replace(/\s+/g, '_') + '.pdf',
     familia: cat,
     titulo: cat.toUpperCase(),   // subtítulo fijo que se muestra en el header del PDF
     orden: 'alfabetico',
   }));
+
+  // Además, un catálogo COMBINADO por tipo de artículo (ej. "Aro"), que junta
+  // TODOS los metales que tengan esa subcategoría (Oro / Aro + Plata / Aro +
+  // Plata Enchapada / Aro, todos en un solo PDF).
+  const items = [...new Set(categorias.map(cat => parsearCategoria(cat).sub))]
+    .sort((a, b) => a.localeCompare(b, 'es'));
+
+  const porItem = items.map(sub => ({
+    archivo: 'Catalogo_Item_' + sub.replace(/\s*\/\s*/g, '_').replace(/\s+/g, '_') + '.pdf',
+    titulo: `${sub.toUpperCase()} — ORO + PLATA`,
+    orden: 'alfabetico',
+    todosLosProductos: true,
+    filtro: p => parsearCategoria((p.Category || '').trim()).sub === sub,
+  }));
+
+  return [...porCategoria, ...porItem];
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -88,6 +105,16 @@ function limpiarCodigo(code) {
   return code;
 }
 
+// Separa "Oro / Anillo" -> {grupo:'Oro', sub:'Anillo'}, "Plata Enchapada / Aro"
+// -> {grupo:'Plata Enchapada', sub:'Aro'}. El "sub" es lo que usamos para
+// unir el mismo tipo de artículo entre distintos metales.
+function parsearCategoria(cat) {
+  const partes = (cat || '').split('/').map(s => s.trim()).filter(Boolean);
+  const grupo = partes[0] || cat;
+  const sub   = partes.slice(1).join(' / ') || grupo;
+  return { grupo, sub };
+}
+
 // Un producto "pertenece" a una familia si su categoría es exactamente esa
 // familia, o si es una subcategoría de ella (empieza con "familia / ").
 // Esto es lo que permite que las subcategorías nuevas en Odoo se incluyan solas.
@@ -98,6 +125,15 @@ function perteneceAFamilia(categoriaProducto, familia) {
 
 function productosDeFamilia(todos, familia) {
   return todos.filter(p => perteneceAFamilia(p.Category, familia));
+}
+
+// Punto único que usan ambos lugares del script que arman la lista de
+// productos de un catálogo — soporta tanto los catálogos "por familia"
+// (Oro / Aro) como los combinados "por artículo" (todosLosProductos: true).
+function productosDeCatalogo(todos, cat) {
+  let prods = cat.todosLosProductos ? todos.slice() : productosDeFamilia(todos, cat.familia);
+  if (cat.filtro) prods = prods.filter(cat.filtro);
+  return prods;
 }
 
 function ordenarProductos(productos, orden) {
@@ -153,8 +189,21 @@ async function odooCall(model, method, args) {
 async function fetchProductos() {
   console.log('📦 Obteniendo productos de Odoo...');
   const raw = await odooCall('product.product', 'search_read', [
-    [], ['default_code','name','list_price','qty_available','virtual_available','categ_id','product_tmpl_id']
+    [], ['default_code','name','list_price','qty_available','virtual_available','categ_id',
+         'product_tmpl_id','metal_type','rock_type','product_template_attribute_value_ids']
   ]);
+
+  // Nombres de los valores de atributo de variante (ej. "13", "15") en un solo batch,
+  // para no hacer una consulta por producto.
+  const attrIds = [...new Set(raw.flatMap(p => p.product_template_attribute_value_ids || []))];
+  const attrNombres = {};
+  if (attrIds.length) {
+    try {
+      const attrs = await odooCall('product.template.attribute.value', 'read', [attrIds, ['name']]);
+      for (const a of attrs) attrNombres[a.id] = a.name;
+    } catch(e) { console.log('  ⚠️  Sin medidas/atributos:', e.message); }
+  }
+
   const productos = raw
     .map(p => ({
       Default_code: p.default_code || '',
@@ -164,6 +213,10 @@ async function fetchProductos() {
       Incoming:     Math.max(0, (p.virtual_available||0) - (p.qty_available||0)),
       Category:     p.categ_id ? p.categ_id[1].trim() : '',
       TmplId:       p.product_tmpl_id ? p.product_tmpl_id[0] : null,
+      Metal:        p.metal_type ? p.metal_type[1] : '',
+      Piedra:       p.rock_type ? p.rock_type[1] : '',
+      Medida:       (p.product_template_attribute_value_ids || [])
+                      .map(id => attrNombres[id]).filter(Boolean).join(', '),
     }))
     // Solo productos con stock > 0 o incoming > 0
     .filter(p => p.Stock > 0 || p.Incoming > 0);
@@ -248,12 +301,12 @@ async function generarPDF(nombreArchivo, productos, orden, caracteristicas, imgs
   const mg     = 4   * MM;
   const headerH  = (210 * (202/1544)) * MM;   // ratio del banner header_aviv.png (1544x202)
   const footerH  = 10  * MM;
-  const COLS     = 4;
+  const COLS     = 3;
   const ROWS     = 4;
-  const PER_PG   = 16;
+  const PER_PG   = 12;
   const cellW    = (PAGE_W - mg*2) / COLS;
   const cellH    = 58  * MM;
-  const imgAreaH = 42  * MM;
+  const imgAreaH = 36  * MM;
   const totalH   = ROWS * cellH;
   const subtitleH = 6 * MM;  // espacio para nombre de subcategoría
   const available = PAGE_H - mg*2 - headerH - subtitleH - footerH;
@@ -357,24 +410,36 @@ async function generarPDF(nombreArchivo, productos, orden, caracteristicas, imgs
 
     const conStar = p.Incoming > 0 && p.Stock === 0;
     const codigo  = limpiarCodigo(p.Default_code) || '';
-    const infoY   = y + imgAreaH + 1.5*MM;
+    let   infoY   = y + imgAreaH + 1*MM;
+
+    const nombre = (p.Name || '').trim();
+    if (nombre) {
+      const nombreCorto = nombre.length > 42 ? nombre.slice(0, 41).trim() + '…' : nombre;
+      doc.fontSize(7.5).fillColor('#333333').font('Helvetica-Bold')
+        .text(nombreCorto, x+1*MM, infoY, { width: cellW-2*MM, align: 'center', lineBreak: false });
+      infoY += 3.3*MM;
+    }
 
     doc.fontSize(9).fillColor('#000000').font('Helvetica-Bold')
       .text(codigo + (conStar ? ' *' : ''), x, infoY,
         { width: cellW, align: 'center', lineBreak: false });
+    infoY += 3.5*MM;
 
     doc.fontSize(8.5).fillColor('#000000').font('Helvetica')
       .text(`$${Math.round(p.Price||0).toLocaleString('es-CL')} + IVA`,
-        x, infoY+3.5*MM, { width: cellW, align: 'center', lineBreak: false });
+        x, infoY, { width: cellW, align: 'center', lineBreak: false });
+    infoY += 3.5*MM;
 
-    const desc = p.TmplId ? caracteristicas[p.TmplId] : null;
-    if (desc) {
-      const txt = desc.replace(/<[^>]+>/g, '').trim();
-      if (txt) {
-        doc.fontSize(8).fillColor('#787878').font('Helvetica')
-          .text(txt, x, infoY+7*MM,
-            { width: cellW, align: 'center', lineBreak: false });
-      }
+    const metalPiedra = [p.Metal, p.Piedra].filter(Boolean).join('  ·  ');
+    if (metalPiedra) {
+      doc.fontSize(7).fillColor('#666666').font('Helvetica')
+        .text(metalPiedra, x+1*MM, infoY, { width: cellW-2*MM, align: 'center', lineBreak: false });
+      infoY += 3*MM;
+    }
+
+    if (p.Medida) {
+      doc.fontSize(7).fillColor('#666666').font('Helvetica')
+        .text(`Medida: ${p.Medida}`, x+1*MM, infoY, { width: cellW-2*MM, align: 'center', lineBreak: false });
     }
 
     pageIdx++;
@@ -703,8 +768,7 @@ async function main() {
   // 3. Determinar todos los códigos necesarios para esta corrida
   const codigosNecesarios = new Set();
   for (const cat of catalogos) {
-    let prods = productosDeFamilia(todos, cat.familia);
-    if (cat.filtro) prods = prods.filter(cat.filtro);
+    let prods = productosDeCatalogo(todos, cat);
     prods.forEach(p => { if (p.Default_code) codigosNecesarios.add(p.Default_code); });
   }
   console.log(`🖼  Productos que necesitan imagen: ${codigosNecesarios.size}`);
@@ -758,8 +822,7 @@ async function main() {
   for (const cat of catalogos) {
     console.log(`\n📄 ${cat.archivo}`);
 
-    let prods = productosDeFamilia(todos, cat.familia);
-    if (cat.filtro) prods = prods.filter(cat.filtro);
+    let prods = productosDeCatalogo(todos, cat);
 
     if (!prods.length) {
       console.log('  ⚠️  Sin productos — generando PDF vacío');
