@@ -1,0 +1,49 @@
+name: Generar Catálogos Aviv
+
+on:
+  schedule:
+    - cron: '0 12 * * 1,4'   # Lunes y jueves 9:00 AM Chile (UTC-3) — ajusta si quieres otra frecuencia
+  workflow_dispatch:          # Botón "Run workflow" para correrlo a mano
+
+permissions:
+  contents: write             # necesario para guardar imagenes_cache.json de vuelta en el repo
+
+jobs:
+  generar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Instalar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Instalar Ghostscript (compresión de PDF)
+        run: sudo apt-get update && sudo apt-get install -y ghostscript
+
+      - name: Instalar dependencias
+        run: npm install
+
+      - name: Generar catálogos
+        env:
+          ODOO_URL:              ${{ secrets.ODOO_URL }}
+          ODOO_DB:                ${{ secrets.ODOO_DB }}
+          ODOO_USERNAME:           ${{ secrets.ODOO_USERNAME }}
+          ODOO_PASSWORD:           ${{ secrets.ODOO_PASSWORD }}
+          GH_TOKEN_RELEASES:       ${{ secrets.GH_TOKEN_RELEASES }}
+          GH_REPO_OWNER:           ${{ secrets.GH_REPO_OWNER }}
+          GH_REPO_NAME:            ${{ secrets.GH_REPO_NAME }}
+        run: node generar-catalogos-aviv.js
+
+      - name: Guardar cache de imágenes en el repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add imagenes_cache.json catalogos_links.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "Actualizar cache de catálogos [skip ci]"
+          git push
