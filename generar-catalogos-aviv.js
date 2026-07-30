@@ -716,7 +716,11 @@ async function subirAGithub(buffer, nombreArchivo, releaseId) {
 
   // Subir con fetch nativo (más estable para buffers grandes)
   const { default: nodeFetch } = await import('node-fetch');
-  const contentType = nombreArchivo.endsWith('.json') ? 'application/json' : 'application/octet-stream';
+  const contentType =
+    nombreArchivo.endsWith('.json') ? 'application/json' :
+    nombreArchivo.endsWith('.pdf')  ? 'application/pdf' :
+    nombreArchivo.endsWith('.html') ? 'text/html' :
+    'application/octet-stream';
   const uploadUrl = `https://uploads.github.com/repos/${GH_REPO_OWNER}/${GH_REPO_NAME}/releases/${releaseId}/assets?name=${encodeURIComponent(nombreArchivo)}`;
 
   const res = await nodeFetch(uploadUrl, {
