@@ -218,26 +218,33 @@ async function fetchProductos() {
       Medida:       (p.product_template_attribute_value_ids || [])
                       .map(id => attrNombres[id]).filter(Boolean).join(', '),
     }))
-    // Solo productos con stock > 0 o incoming > 0
-    .filter(p => p.Stock > 0 || p.Incoming > 0);
+    // Solo productos con stock disponible AHORA (sin "en camino")
+    .filter(p => p.Stock > 0);
   console.log(`✅ ${productos.length} productos con stock`);
   return productos;
 }
 
-async function fetchCaracteristicas() {
-  try {
-    console.log('📋 Obteniendo descripciones desde Odoo...');
-    const raw = await odooCall('product.template', 'search_read', [
-      [['description_ecommerce', '!=', false]],
-      ['id', 'description_ecommerce']
-    ]);
-    const map = {};
-    for (const t of raw) {
-      if (t.description_ecommerce) map[t.id] = t.description_ecommerce;
-    }
-    console.log(`✅ ${Object.keys(map).length} descripciones obtenidas`);
-    return map;
-  } catch(e) { console.log('  ⚠️  Sin descripciones:', e.message); return {}; }
+// Junta todas las variantes de un mismo producto (misma plantilla de Odoo) en
+// UNA sola fila del catálogo, combinando sus medidas en vez de repetir una
+// tarjeta por cada talla. Ej: 3 variantes con Medida 12/13/16 del mismo anillo
+// -> una tarjeta con "Medida: 12, 13, 16".
+function agruparPorMedidas(productos) {
+  const grupos = new Map();
+  for (const p of productos) {
+    const key = p.TmplId != null ? `t${p.TmplId}` : `n${p.Name}|${p.Category}`;
+    if (!grupos.has(key)) grupos.set(key, { ...p, _medidas: new Set(), _stockTotal: 0 });
+    const g = grupos.get(key);
+    if (p.Medida) g._medidas.add(p.Medida);
+    g._stockTotal += p.Stock || 0;
+    if (!g.Default_code && p.Default_code) g.Default_code = p.Default_code;
+  }
+  return [...grupos.values()].map(g => {
+    const medidas = [...g._medidas].sort((a, b) => {
+      const na = parseFloat(a), nb = parseFloat(b);
+      return (!isNaN(na) && !isNaN(nb)) ? na - nb : a.localeCompare(b, 'es');
+    });
+    return { ...g, Medida: medidas.join(', '), Stock: g._stockTotal };
+  });
 }
 
 // Descarga imágenes en lote desde Odoo — solo los códigos que se pidan
@@ -294,7 +301,7 @@ function guardarCache(cache) {
 // ══════════════════════════════════════════════════════════════════════════════
 // GENERADOR PDF
 // ══════════════════════════════════════════════════════════════════════════════
-async function generarPDF(nombreArchivo, productos, orden, caracteristicas, imgs, tituloCategoria) {
+async function generarPDF(nombreArchivo, productos, orden, imgs, tituloCategoria) {
   const MM     = 2.8346;
   const PAGE_W = 210 * MM;
   const PAGE_H = 297 * MM;
@@ -311,7 +318,6 @@ async function generarPDF(nombreArchivo, productos, orden, caracteristicas, imgs
   const subtitleH = 6 * MM;  // espacio para nombre de subcategoría
   const available = PAGE_H - mg*2 - headerH - subtitleH - footerH;
   const vOffset  = subtitleH + (available - totalH) / 2;
-  const hasIncoming = productos.some(p => p.Incoming > 0 && p.Stock === 0);
 
   const doc    = new PDFDocument({ size: 'A4', margin: 0, autoFirstPage: false });
   const chunks = [];
@@ -343,11 +349,6 @@ async function generarPDF(nombreArchivo, productos, orden, caracteristicas, imgs
     doc.fontSize(8).fillColor('#888888').font('Helvetica')
       .text(`Precios sin IVA  ·  ${fecha}  |  AVIV`,
         mg, fy+1.5*MM, { width: PAGE_W-mg*2, align: 'center' });
-    if (hasIncoming) {
-      doc.fontSize(7.5).fillColor('#888888').font('Helvetica-Oblique')
-        .text('* Productos no disponibles para despacho inmediato',
-          mg, fy+5.5*MM, { width: PAGE_W-mg*2, align: 'center' });
-    }
   }
 
   let pageIdx    = 0;
@@ -408,7 +409,6 @@ async function generarPDF(nombreArchivo, productos, orden, caracteristicas, imgs
       doc.rect(x, y, cellW, imgAreaH).fill('#f5f5f5');
     }
 
-    const conStar = p.Incoming > 0 && p.Stock === 0;
     const codigo  = limpiarCodigo(p.Default_code) || '';
     let   infoY   = y + imgAreaH + 1*MM;
 
@@ -421,7 +421,7 @@ async function generarPDF(nombreArchivo, productos, orden, caracteristicas, imgs
     }
 
     doc.fontSize(9).fillColor('#000000').font('Helvetica-Bold')
-      .text(codigo + (conStar ? ' *' : ''), x, infoY,
+      .text(codigo, x, infoY,
         { width: cellW, align: 'center', lineBreak: false });
     infoY += 3.5*MM;
 
@@ -744,13 +744,11 @@ async function subirAGithub(buffer, nombreArchivo, releaseId) {
 async function main() {
   const filtroArg = process.argv[2];
 
-  // 1. Obtener stock y características en paralelo
+  // 1. Obtener stock de Odoo
   console.log('📦 Obteniendo datos de Odoo...');
-  const [todos, caracteristicas] = await Promise.all([
-    fetchProductos(),
-    fetchCaracteristicas()
-  ]);
-  console.log(`✅ ${todos.length} productos con stock | ${Object.keys(caracteristicas).length} con características\n`);
+  const productosRaw = await fetchProductos();
+  const todos = agruparPorMedidas(productosRaw);
+  console.log(`✅ ${productosRaw.length} variantes con stock agrupadas en ${todos.length} productos\n`);
 
   // 2. Determinar qué catálogos generar — construidos dinámicamente desde
   //    las categorías reales que traen los productos de Odoo (sin lista a mano)
@@ -832,7 +830,7 @@ async function main() {
     console.log(`  📊 ${prods.length} productos, orden: ${cat.orden}`);
 
     try {
-      const buffer = await generarPDF(cat.archivo, prods, cat.orden, caracteristicas, cache, cat.titulo);
+      const buffer = await generarPDF(cat.archivo, prods, cat.orden, cache, cat.titulo);
       console.log(`  ✅ PDF: ${(buffer.length/1024).toFixed(0)} KB`);
 
       // GitHub Releases — comprimir si pesa mas de 15MB
