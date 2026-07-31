@@ -842,40 +842,79 @@ async function subirAGithub(buffer, nombreArchivo, releaseId) {
   const nombreLimpio = nombreArchivo.replace(/\s+/g, '_');
   nombreArchivo = nombreLimpio;
 
-  // Borrar asset anterior si existe
-  try {
-    const assets = await axios.get(
-      `https://api.github.com/repos/${GH_REPO_OWNER}/${GH_REPO_NAME}/releases/${releaseId}/assets`,
-      { headers: { Authorization: `Bearer ${GH_TOKEN}`, Accept: 'application/vnd.github+json' } }
-    );
-    const existing = assets.data.find(a => a.name === nombreArchivo);
-    if (existing) {
-      await axios.delete(
-        `https://api.github.com/repos/${GH_REPO_OWNER}/${GH_REPO_NAME}/releases/assets/${existing.id}`,
-        { headers: { Authorization: `Bearer ${GH_TOKEN}`, Accept: 'application/vnd.github+json' } }
+  async function listarAssets() {
+    // GitHub devuelve solo 30 assets por página si no se pide más — con
+    // 30+ catálogos esto hacía que algunos no se encontraran nunca para
+    // borrar, y el upload fallaba con "Validation Failed" (nombre duplicado).
+    const todos = [];
+    let page = 1;
+    while (true) {
+      const res = await axios.get(
+        `https://api.github.com/repos/${GH_REPO_OWNER}/${GH_REPO_NAME}/releases/${releaseId}/assets`,
+        { headers: { Authorization: `Bearer ${GH_TOKEN}`, Accept: 'application/vnd.github+json' },
+          params: { per_page: 100, page } }
       );
+      todos.push(...res.data);
+      if (res.data.length < 100) break;
+      page++;
     }
-  } catch(e) {}
+    return todos;
+  }
+
+  async function borrarSiExiste() {
+    try {
+      const assets = await listarAssets();
+      const existing = assets.find(a => a.name === nombreArchivo);
+      if (existing) {
+        await axios.delete(
+          `https://api.github.com/repos/${GH_REPO_OWNER}/${GH_REPO_NAME}/releases/assets/${existing.id}`,
+          { headers: { Authorization: `Bearer ${GH_TOKEN}`, Accept: 'application/vnd.github+json' } }
+        );
+        return true;
+      }
+    } catch(e) {}
+    return false;
+  }
+
+  // Borrar asset anterior si existe
+  await borrarSiExiste();
 
   // Subir con fetch nativo (más estable para buffers grandes)
   const { default: nodeFetch } = await import('node-fetch');
   const contentType = nombreArchivo.endsWith('.json') ? 'application/json' : 'application/octet-stream';
   const uploadUrl = `https://uploads.github.com/repos/${GH_REPO_OWNER}/${GH_REPO_NAME}/releases/${releaseId}/assets?name=${encodeURIComponent(nombreArchivo)}`;
 
-  const res = await nodeFetch(uploadUrl, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${GH_TOKEN}`,
-      Accept: 'application/vnd.github+json',
-      'Content-Type': contentType,
-      'Content-Length': String(buffer.length),
-    },
-    body: buffer,
-  });
+  async function subir() {
+    return nodeFetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${GH_TOKEN}`,
+        Accept: 'application/vnd.github+json',
+        'Content-Type': contentType,
+        'Content-Length': String(buffer.length),
+      },
+      body: buffer,
+    });
+  }
 
+  let res = await subir();
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.message || `HTTP ${res.status}`);
+    const yaExiste = res.status === 422 &&
+      JSON.stringify(err).toLowerCase().includes('already_exists');
+    if (yaExiste) {
+      // Red de seguridad: si igual quedó un asset con ese nombre (carrera
+      // entre corridas, o algún caso no cubierto por la paginación de
+      // arriba), lo borramos explícitamente y reintentamos una vez.
+      const borrado = await borrarSiExiste();
+      if (borrado) {
+        res = await subir();
+      }
+    }
+    if (!res.ok) {
+      const err2 = await res.json().catch(() => ({}));
+      throw new Error(err2.message || err.message || `HTTP ${res.status}`);
+    }
   }
   const data = await res.json();
   return data.browser_download_url;
